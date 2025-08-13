@@ -2,28 +2,32 @@ package assets
 
 import (
 	"fmt"
+	"go-exchange/common/enum"
+	"go-exchange/common/serror"
 	"math/big"
 	"sync"
 )
 
 type AssetService struct {
 	// userID -> (assetEnum -> *Asset)
-	userAssets sync.Map // key: int64, val: *sync.Map
+	userAssets sync.Map            // key: int64, val: *sync.Map
+	registry   enum.AssetRegistry // for dynamically add asset kind
+}
+
+func NewAssetService(reg enum.AssetRegistry) *AssetService {
+	return &AssetService{registry: reg}
 }
 
 // get the whole assets map of a certain user
 func (a *AssetService) getUserAssets(userID int64) *sync.Map {
 	m, _ := a.userAssets.LoadOrStore(userID, &sync.Map{})
-	return m.(*sync.Map) // assetEnum -> *Asset	
+	return m.(*sync.Map) // assetEnum -> *Asset
 }
 
 // get a certain kind of asset of the user
 // if it doesn't exist, create it
-func (a *AssetService) getOrCreateAssetType(userID int64, kind AssetsEnum) *Asset {
+func (a *AssetService) getOrCreateAssetType(userID int64, kind enum.AssetID) *Asset {
 	m := a.getUserAssets(userID)
-	if m == nil {
-		return nil
-	}
 
 	if v, ok := m.Load(kind); ok {
 		return v.(*Asset)
@@ -36,13 +40,16 @@ func (a *AssetService) getOrCreateAssetType(userID int64, kind AssetsEnum) *Asse
 	return newAssetKind
 }
 
-func lockPair(fromUser, toUser int64, kind AssetsEnum, from, to *Asset) func() {
+func lockPair(fromUser, toUser int64, kind enum.AssetID, from, to *Asset) func() {
 	if from == to {
 		from.mu.Lock()
 		return func() { from.mu.Unlock() }
 	}
 	// stable order by (userID, kind)
-	type key struct{ user int64; k AssetsEnum }
+	type key struct {
+		user int64
+		k    enum.AssetID
+	}
 	k1, k2 := key{fromUser, kind}, key{toUser, kind}
 	less := func(a, b key) bool { // total order
 		if a.user != b.user {
@@ -51,14 +58,16 @@ func lockPair(fromUser, toUser int64, kind AssetsEnum, from, to *Asset) func() {
 		return a.k < b.k
 	}
 	if less(k1, k2) {
-		from.mu.Lock(); to.mu.Lock()
+		from.mu.Lock()
+		to.mu.Lock()
 		return func() { to.mu.Unlock(); from.mu.Unlock() }
 	}
-	to.mu.Lock(); from.mu.Lock()
+	to.mu.Lock()
+	from.mu.Lock()
 	return func() { from.mu.Unlock(); to.mu.Unlock() }
 }
 
-func (a *AssetService) Freeze(userID int64, kind AssetsEnum, amount *big.Float) (bool, error) {
+func (a *AssetService) Freeze(userID int64, kind enum.AssetID, amount *big.Float) (bool, error) {
 	ok, err := a.Transfer(AvailableToFrozen, userID, userID, kind, amount, true)
 	if err != nil {
 		return false, err
@@ -66,10 +75,10 @@ func (a *AssetService) Freeze(userID int64, kind AssetsEnum, amount *big.Float) 
 	return ok, nil
 }
 
-func (a *AssetService) Unfreeze(userId int64, kind AssetsEnum, amount *big.Float) (bool, error){
-	ok, err := a.Transfer(FrozenToAvailable, userId, userId, kind, amount, true)
+func (a *AssetService) Unfreeze(userID int64, kind enum.AssetID, amount *big.Float) (bool, error) {
+	ok, err := a.Transfer(FrozenToAvailable, userID, userID, kind, amount, true)
 	if err != nil {
-		return false, err
+		return false, serror.ErrInsufficientFrozen
 	}
 	return ok, err
 }
@@ -77,7 +86,7 @@ func (a *AssetService) Unfreeze(userId int64, kind AssetsEnum, amount *big.Float
 func (a *AssetService) Transfer(
 	transferType TransferType,
 	fromUser, toUser int64,
-	assetKind AssetsEnum,
+	assetKind enum.AssetID,
 	amount *big.Float,
 	checkBalance bool,
 ) (bool, error) {
@@ -88,7 +97,11 @@ func (a *AssetService) Transfer(
 	case 0:
 		return true, nil
 	case -1:
-		return false, fmt.Errorf("param:amount is negative")
+		return false, serror.ErrNegativeAmount
+	}
+
+	if a.registry != nil && !a.registry.Exists(assetKind) {
+		return false, serror.ErrUnknownAsset
 	}
 
 	fromAsset := a.getOrCreateAssetType(fromUser, assetKind)
@@ -100,21 +113,21 @@ func (a *AssetService) Transfer(
 	switch transferType {
 	case AvailableToAvailable:
 		if checkBalance && fromAsset.available.Cmp(amount) < 0 {
-			return false, nil
+			return false, serror.ErrInsufficientAvailable
 		}
 		fromAsset.available.Sub(fromAsset.available, amount)
 		toAsset.available.Add(toAsset.available, amount)
 		return true, nil
 	case AvailableToFrozen:
 		if checkBalance && fromAsset.available.Cmp(amount) < 0 {
-			return false, nil
+			return false, serror.ErrInsufficientAvailable
 		}
 		fromAsset.available.Sub(fromAsset.available, amount)
 		toAsset.frozen.Add(toAsset.frozen, amount)
 		return true, nil
 	case FrozenToAvailable:
 		if checkBalance && fromAsset.frozen.Cmp(amount) < 0 {
-			return false, nil
+			return false, serror.ErrInsufficientAvailable
 		}
 		fromAsset.frozen.Sub(fromAsset.frozen, amount)
 		toAsset.available.Add(toAsset.available, amount)

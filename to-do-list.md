@@ -1,0 +1,1 @@
+1. hot-upate asset type. When adding new asset type, don't need to restart service
