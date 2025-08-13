@@ -58,7 +58,23 @@ func lockPair(fromUser, toUser int64, kind AssetsEnum, from, to *Asset) func() {
 	return func() { from.mu.Unlock(); to.mu.Unlock() }
 }
 
-func (a *AssetService) tryTransfer(
+func (a *AssetService) Freeze(userID int64, kind AssetsEnum, amount *big.Float) (bool, error) {
+	ok, err := a.Transfer(AvailableToFrozen, userID, userID, kind, amount, true)
+	if err != nil {
+		return false, err
+	}
+	return ok, nil
+}
+
+func (a *AssetService) Unfreeze(userId int64, kind AssetsEnum, amount *big.Float) (bool, error){
+	ok, err := a.Transfer(FrozenToAvailable, userId, userId, kind, amount, true)
+	if err != nil {
+		return false, err
+	}
+	return ok, err
+}
+
+func (a *AssetService) Transfer(
 	transferType TransferType,
 	fromUser, toUser int64,
 	assetKind AssetsEnum,
